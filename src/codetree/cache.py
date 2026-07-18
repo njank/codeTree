@@ -12,7 +12,10 @@ class Cache:
         """Load cache from disk. No-op if cache file doesn't exist or is corrupt."""
         if self._cache_file.exists():
             try:
-                self._data = json.loads(self._cache_file.read_text())
+                loaded = json.loads(self._cache_file.read_text())
+                # Normalize legacy Windows keys (src\a.py) to POSIX (src/a.py)
+                # so caches written before path normalization keep working.
+                self._data = {k.replace("\\", "/"): v for k, v in loaded.items()}
             except (json.JSONDecodeError, OSError):
                 self._data = {}
 

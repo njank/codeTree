@@ -7,7 +7,7 @@
 
 **Stop feeding entire files to your AI agent.**
 
-codetree is an [MCP](https://modelcontextprotocol.io/) server that gives coding agents structured code understanding via [tree-sitter](https://tree-sitter.github.io/) — so they ask precise questions instead of reading thousands of lines. 23 tools, 11 languages, ~1 second startup. No vector DB, no embedding model, no config.
+codetree is an [MCP](https://modelcontextprotocol.io/) server that gives coding agents structured code understanding via [tree-sitter](https://tree-sitter.github.io/) — so they ask precise questions instead of reading thousands of lines. 23 tools, 12 languages, ~1 second startup. No vector DB, no embedding model, no config.
 
 ## Quick Start
 
@@ -152,7 +152,70 @@ The agent sees every class, method, and docstring — with line numbers — with
 | C | `.c`, `.h` |
 | C++ | `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh` |
 | Ruby | `.rb` |
-| Kotlin | `.kt` |
+| Kotlin | `.kt`, `.kts` |
+| Oracle PL/SQL | `.pks`, `.pkb`, `.prc`, `.fct`, `.tps`, `.tpb`, `.trg` |
+
+Oracle PL/SQL support is optional and activates only when the `tree-sitter-plsql` Python package is installed — see [Oracle PL/SQL Setup](#oracle-plsql-setup).
+
+## Oracle PL/SQL Setup
+
+PL/SQL support is backed by [njank/tree-sitter-plsql](https://github.com/njank/tree-sitter-plsql) and covers packages (spec + body), standalone procedures/functions, object types, triggers, cursors and package-level types. Identifier matching is case-insensitive.
+
+### Installation
+
+Requires Python 3.10+. Create a venv, install codetree in dev mode, then install the grammar's Python bindings:
+
+```bash
+cd codeTree
+python -m venv .venv
+# Windows: .venv\Scripts\activate    Linux/macOS: source .venv/bin/activate
+pip install -e .
+pip install -e /path/to/tree-sitter-plsql
+```
+
+Registration is guarded: without `tree-sitter-plsql` installed, codetree works exactly as before. `.sql` files are NOT indexed by default (often generic/migration SQL); opt in extra suffixes via the environment variable `CODETREE_PLSQL_EXTENSIONS=".sql,.pkg"` — and filter unwanted ones back out with `--exclude` (see below).
+
+### Scoping the index
+
+Two CLI flags keep startup fast on large repos:
+
+```bash
+codetree --root /path/to/db-repo --include src --exclude *.sql
+```
+
+- `--include DIR` (repeatable): only index files under this folder relative to root. Excluded folders (build artifacts, test fixtures) are never touched.
+- `--exclude PATTERN` (repeatable): skip files matching a case-insensitive glob, matched against the file name and the root-relative path (e.g. `*.sql`, `src/generated/*`).
+
+After changing these flags, delete the repo's `.codetree` folder once so stale cache entries don't linger.
+
+### Startup benchmark
+
+`bench_startup.py` measures cold and warm server startup for every git repo under a root directory that contains at least one `.pks` file under `src/`. Each repo is timed in its own subprocess, exactly like Claude Desktop launching one server per configured repo:
+
+```bash
+python bench_startup.py --cold    # full reindex (first-ever start; deletes .codetree)
+python bench_startup.py           # warm start (what you feel on every launch)
+python bench_startup.py --root D:\other\dir
+```
+
+The cold build happens once; warm starts skip unchanged files via mtime and sha256 caches and should take only a few seconds.
+
+### Claude Desktop
+
+Add one entry per repo to `claude_desktop_config.json` (Windows: `%APPDATA%\Claude\claude_desktop_config.json`), pointing at the venv so no activation is needed:
+
+```json
+{
+  "mcpServers": {
+    "codetree-mydb": {
+      "command": "C:\\path\\to\\codeTree\\.venv\\Scripts\\codetree.exe",
+      "args": ["--root", "C:\\git\\mydb", "--include", "src", "--exclude", "*.sql"]
+    }
+  }
+}
+```
+
+On Linux/macOS use `<codeTree>/.venv/bin/codetree` as the command. If `codetree.exe` is missing, use the venv's `python` with `"args": ["-m", "codetree", ...]` instead. Fully quit and restart Claude Desktop afterwards; the first start performs the full index.
 
 ## Editor Setup
 

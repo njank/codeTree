@@ -58,6 +58,78 @@ class TestIndexerBuild:
         idx.build()
         assert not any("__pycache__" in k for k in idx._index)
 
+    def test_include_restricts_to_allowlisted_dirs(self, tmp_path):
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "core.py").write_text("def core_fn(): pass")
+        (tmp_path / "fixtures").mkdir()
+        (tmp_path / "fixtures" / "junk.py").write_text("def junk_fn(): pass")
+        (tmp_path / "top.py").write_text("def top_fn(): pass")
+        idx = Indexer(str(tmp_path), include=["src"])
+        idx.build()
+        keys = set(idx._index)
+        assert any("core.py" in k for k in keys)
+        assert not any("junk.py" in k for k in keys)
+        assert not any("top.py" in k for k in keys)
+        assert idx._included("src/core.py")
+        assert not idx._included("fixtures/junk.py")
+
+    def test_exclude_filters_matching_files(self, tmp_path):
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "core.py").write_text("def core_fn(): pass")
+        (tmp_path / "src" / "gen.py").write_text("def gen_fn(): pass")
+        idx = Indexer(str(tmp_path), exclude=["gen.*"])
+        idx.build()
+        keys = set(idx._index)
+        assert any("core.py" in k for k in keys)
+        assert not any("gen.py" in k for k in keys)
+        assert idx._excluded("src/gen.py")
+        assert not idx._excluded("src/core.py")
+
+    def test_exclude_matches_relative_path_pattern(self, tmp_path):
+        (tmp_path / "src" / "generated").mkdir(parents=True)
+        (tmp_path / "src" / "generated" / "a.py").write_text("def a_fn(): pass")
+        (tmp_path / "src" / "b.py").write_text("def b_fn(): pass")
+        idx = Indexer(str(tmp_path), exclude=["src/generated/*"])
+        idx.build()
+        keys = set(idx._index)
+        assert not any("a.py" in k for k in keys)
+        assert any("b.py" in k for k in keys)
+
+    def test_exclude_none_indexes_everything(self, tmp_path):
+        (tmp_path / "core.py").write_text("def core_fn(): pass")
+        idx = Indexer(str(tmp_path))
+        idx.build()
+        assert not idx._excluded("core.py")
+        assert any("core.py" in k for k in idx._index)
+
+    def test_include_none_indexes_whole_repo(self, tmp_path):
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "core.py").write_text("def core_fn(): pass")
+        (tmp_path / "top.py").write_text("def top_fn(): pass")
+        idx = Indexer(str(tmp_path))
+        idx.build()
+        assert any("top.py" in k for k in idx._index)
+        assert idx._included("anything/at/all.py")
+
+    def test_index_keys_are_posix(self, tmp_path):
+        (tmp_path / "src" / "pkg").mkdir(parents=True)
+        (tmp_path / "src" / "pkg" / "mod.py").write_text("def fn(): pass")
+        idx = Indexer(str(tmp_path))
+        idx.build()
+        assert "src/pkg/mod.py" in idx._index
+        assert not any("\\" in k for k in idx._index)
+
+    def test_lookups_accept_backslash_paths(self, tmp_path):
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "mod.py").write_text("def fn(): pass")
+        idx = Indexer(str(tmp_path))
+        idx.build()
+        # agents on Windows pass backslash paths; both styles must work
+        assert idx.get_skeleton("src\\mod.py")
+        assert idx.get_skeleton("src/mod.py")
+        assert idx.get_entry("src\\mod.py") is not None
+        assert idx.get_symbol("src\\mod.py", "fn") is not None
+
     def test_indexes_files_in_subdirectories(self, tmp_path):
         (tmp_path / "src").mkdir()
         (tmp_path / "src" / "utils.py").write_text("def helper(): pass")

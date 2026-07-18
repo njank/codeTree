@@ -66,11 +66,19 @@ class GraphStore:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(_SCHEMA_SQL)
-            # Set schema version if not exists
+            # Enforce schema version: on mismatch, drop all data so the
+            # graph is rebuilt from scratch (e.g. v1 -> v2 path normalization).
             cur = self._conn.execute("SELECT value FROM meta WHERE key='schema_version'")
-            if cur.fetchone() is None:
+            row = cur.fetchone()
+            if row is not None and row[0] != SCHEMA_VERSION:
+                self._conn.executescript(
+                    "DELETE FROM edges; DELETE FROM symbols; "
+                    "DELETE FROM files; DELETE FROM meta;"
+                )
+                row = None
+            if row is None:
                 self._conn.execute(
-                    "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
+                    "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
                     (SCHEMA_VERSION,),
                 )
                 self._conn.commit()

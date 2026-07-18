@@ -1,7 +1,7 @@
 import pytest
 import tempfile
 from pathlib import Path
-from codetree.graph.store import GraphStore
+from codetree.graph.store import GraphStore, SCHEMA_VERSION
 from codetree.graph.models import SymbolNode, Edge
 
 
@@ -24,13 +24,13 @@ class TestGraphStoreSchema:
 
     def test_schema_version_stored(self, store):
         val = store.get_meta("schema_version")
-        assert val == "1"
+        assert val == SCHEMA_VERSION
 
     def test_idempotent_open(self, store):
         # Opening twice should not fail
         store.close()
         store.open()
-        assert store.get_meta("schema_version") == "1"
+        assert store.get_meta("schema_version") == SCHEMA_VERSION
 
 
 class TestSymbolCRUD:
@@ -159,3 +159,29 @@ class TestStats:
         assert stats["files"] == 1
         assert stats["symbols"] == 2
         assert stats["edges"] == 1
+
+
+def test_schema_version_mismatch_clears_data(tmp_path):
+    """Old-schema graphs (e.g. v1 backslash paths) must be dropped and rebuilt."""
+    from codetree.graph.store import GraphStore, SCHEMA_VERSION
+    from codetree.graph.models import SymbolNode
+
+    store = GraphStore(str(tmp_path))
+    store.open()
+    store.begin()
+    store.upsert_symbol(SymbolNode(
+        qualified_name="a.py::fn", name="fn", kind="function",
+        file_path="a.py", start_line=1, end_line=None, parent_qn=None,
+        doc="", params="", is_test=False, is_entry_point=False))
+    store.commit()
+    # simulate an old database
+    store._conn.execute("UPDATE meta SET value='0' WHERE key='schema_version'")
+    store._conn.commit()
+    store.close()
+
+    store2 = GraphStore(str(tmp_path))
+    store2.open()
+    assert store2.stats()["symbols"] == 0
+    cur = store2._conn.execute("SELECT value FROM meta WHERE key='schema_version'")
+    assert cur.fetchone()[0] == SCHEMA_VERSION
+    store2.close()

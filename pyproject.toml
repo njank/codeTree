@@ -41,6 +41,13 @@ dependencies = [
     "fastmcp>=2.0.0",
 ]
 
+# Oracle PL/SQL support is optional: tree-sitter-plsql is not on PyPI.
+# Install it from the grammar repo, e.g.:
+#   pip install /path/to/tree-sitter-plsql
+# or as a pinned git dependency:
+#   pip install "tree-sitter-plsql @ git+https://github.com/njank/tree-sitter-plsql"
+# The plugin registers itself automatically once the package is importable.
+
 [project.scripts]
 codetree = "codetree.__main__:main"
 

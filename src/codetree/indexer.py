@@ -1,4 +1,17 @@
+import os
+from fnmatch import fnmatch
 from pathlib import Path
+
+
+def _norm_rel(path: str | Path) -> str:
+    """Normalize a repo-relative path to POSIX separators.
+
+    Index keys are stored POSIX-style on every platform; agents pass
+    both `src/a.pks` and `src\\a.pks`, and on Windows the raw
+    `str(Path.relative_to(...))` form used to leak backslashes into
+    keys, caches and the graph, breaking forward-slash lookups.
+    """
+    return str(path).replace("\\", "/")
 from dataclasses import dataclass
 from .languages.base import LanguagePlugin
 from .registry import get_plugin
@@ -32,8 +45,23 @@ class Indexer:
         "setup", "teardown", "setUp", "tearDown",
     }
 
-    def __init__(self, root: str | Path):
+    def __init__(self, root: str | Path, include: list[str] | None = None,
+                 exclude: list[str] | None = None):
         self.root = Path(root)
+        # Optional allow-list of folders (relative to root) to index, e.g.
+        # ["src"]. None means the whole repo. Normalized to POSIX-style
+        # prefixes without trailing slashes.
+        self.include: tuple[str, ...] | None = (
+            tuple(sorted({Path(d).as_posix().strip("/") for d in include}))
+            if include else None
+        )
+        # Optional deny-list of glob patterns, e.g. ["*.sql"]. Matched
+        # case-insensitively against the file name and the POSIX-style
+        # path relative to root.
+        self.exclude: tuple[str, ...] | None = (
+            tuple(sorted({p.strip().lower() for p in exclude if p.strip()}))
+            if exclude else None
+        )
         self._index: dict[str, FileEntry] = {}
         self._definitions: dict[str, list[tuple[str, int]]] = {}
         # Keys are "rel_path::symbol_name" to prevent name collisions across files.
@@ -63,6 +91,23 @@ class Indexer:
             if part.endswith(".egg-info"):
                 return True
         return False
+
+    def _included(self, rel_path: str | Path) -> bool:
+        """True if rel_path falls under one of the --include folders (or no allow-list is set)."""
+        if self.include is None:
+            return True
+        rel = Path(rel_path).as_posix()
+        return any(rel == inc or rel.startswith(inc + "/") for inc in self.include)
+
+    def _excluded(self, rel_path: str | Path) -> bool:
+        """True if rel_path matches one of the --exclude glob patterns."""
+        if self.exclude is None:
+            return False
+        rel = Path(rel_path)
+        name = rel.name.lower()
+        rel_posix = rel.as_posix().lower()
+        return any(fnmatch(name, pat) or fnmatch(rel_posix, pat)
+                   for pat in self.exclude)
 
     def _rebuild_definitions(self) -> None:
         """Rebuild _definitions from current _index using qualified (file::name) keys.
@@ -97,42 +142,60 @@ class Indexer:
         the caller injects them via inject_cached().
         """
         cached_mtimes = cached_mtimes or {}
-        for candidate in self.root.rglob("*"):
-            if candidate.is_symlink():
-                continue
-            if not candidate.is_file():
-                continue
-            plugin = get_plugin(candidate)
-            if plugin is None:
-                continue
-            if self._should_skip(candidate.relative_to(self.root)):
-                continue
-            rel = str(candidate.relative_to(self.root))
-            mtime = candidate.stat().st_mtime
-            if cached_mtimes.get(rel) == mtime:
-                continue
-            source = candidate.read_bytes()
-            try:
-                skeleton = plugin.extract_skeleton(source)
-                has_errors = plugin.check_syntax(source)
-            except Exception:
-                # ROBUST-01: Plugin crash (any exception) skips this file gracefully.
-                # File is still added to _index with empty skeleton and has_errors=True
-                # so tools that check entry.has_errors can warn the caller.
-                skeleton = []
-                has_errors = True
-            self._index[rel] = FileEntry(
-                path=candidate,
-                source=source,
-                skeleton=skeleton,
-                mtime=mtime,
-                language=candidate.suffix.lstrip("."),
-                plugin=plugin,
-                has_errors=has_errors,
-            )
+        if self.include is None:
+            walk_roots = [self.root]
+        else:
+            # Walk ONLY the allow-listed subtrees, so excluded folders
+            # (build artifacts, test fixtures, ...) are never touched.
+            walk_roots = [self.root / inc for inc in self.include
+                          if (self.root / inc).is_dir()]
+        for walk_root in walk_roots:
+            self._walk_and_index(walk_root, cached_mtimes)
 
         # Build definition index from skeleton data (qualified keys, no duplicates, no ghosts)
         self._rebuild_definitions()
+
+    def _walk_and_index(self, walk_root: Path, cached_mtimes: dict[str, float]):
+        for dirpath, dirnames, filenames in os.walk(walk_root, followlinks=False):
+            # Prune skipped dirs IN PLACE so os.walk never descends into them.
+            # rglob("*") walked .venv/.git/node_modules and filtered afterwards,
+            # which cost tens of seconds per repo on Windows.
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in self.SKIP_DIRS and not d.endswith(".egg-info")
+            ]
+            for fname in filenames:
+                candidate = Path(dirpath) / fname
+                plugin = get_plugin(candidate)
+                if plugin is None:
+                    continue
+                if candidate.is_symlink():
+                    continue
+                rel = candidate.relative_to(self.root).as_posix()
+                if self._excluded(rel):
+                    continue
+                mtime = candidate.stat().st_mtime
+                if cached_mtimes.get(rel) == mtime:
+                    continue
+                source = candidate.read_bytes()
+                try:
+                    skeleton = plugin.extract_skeleton(source)
+                    has_errors = plugin.check_syntax(source)
+                except Exception:
+                    # ROBUST-01: Plugin crash (any exception) skips this file gracefully.
+                    # File is still added to _index with empty skeleton and has_errors=True
+                    # so tools that check entry.has_errors can warn the caller.
+                    skeleton = []
+                    has_errors = True
+                self._index[rel] = FileEntry(
+                    path=candidate,
+                    source=source,
+                    skeleton=skeleton,
+                    mtime=mtime,
+                    language=candidate.suffix.lstrip("."),
+                    plugin=plugin,
+                    has_errors=has_errors,
+                )
 
     def inject_cached(self, rel_path: str, py_file: Path, source: bytes,
                       skeleton: list[dict], mtime: float):
@@ -141,7 +204,7 @@ class Indexer:
         plugin = get_plugin(py_file)
         if plugin is None:
             return
-        self._index[rel_path] = FileEntry(
+        self._index[_norm_rel(rel_path)] = FileEntry(
             path=py_file,
             source=source,
             skeleton=skeleton,
@@ -153,12 +216,16 @@ class Indexer:
         # are complete, the caller must invoke _rebuild_definitions() to rebuild
         # the definition index from _index (DATA-01, DATA-02, DATA-03 fix).
 
+    def get_entry(self, rel_path: str) -> FileEntry | None:
+        """Index lookup accepting both / and \\ separators (agents use both)."""
+        return self._index.get(_norm_rel(rel_path))
+
     def get_skeleton(self, rel_path: str) -> list[dict]:
-        entry = self._index.get(rel_path)
+        entry = self.get_entry(rel_path)
         return entry.skeleton if entry else []
 
     def get_symbol(self, rel_path: str, symbol_name: str) -> tuple[str, int] | None:
-        entry = self._index.get(rel_path)
+        entry = self.get_entry(rel_path)
         if entry is None:
             return None
         return entry.plugin.extract_symbol_source(entry.source, symbol_name)
@@ -171,7 +238,7 @@ class Indexer:
         return results
 
     def get_call_graph(self, rel_path: str, function_name: str) -> dict:
-        entry = self._index.get(rel_path)
+        entry = self.get_entry(rel_path)
         calls = entry.plugin.extract_calls_in_function(entry.source, function_name) if entry else []
         callers = []
         for rp, e in self._index.items():
@@ -220,6 +287,7 @@ class Indexer:
         """
         dead = []
         if file_path:
+            file_path = _norm_rel(file_path)
             files_to_check = {file_path: self._index[file_path]} if file_path in self._index else {}
         else:
             files_to_check = self._index
@@ -261,7 +329,7 @@ class Indexer:
         """
         self._ensure_call_graph()
 
-        target_key = f"{file_path}::{symbol_name}"
+        target_key = f"{_norm_rel(file_path)}::{symbol_name}"
 
         def _bfs(graph: dict[str, set[str]], start: str) -> list[dict]:
             """BFS through graph, returning nodes with depth."""
@@ -302,7 +370,7 @@ class Indexer:
 
         Returns None if file not found.
         """
-        entry = self._index.get(rel_path)
+        entry = self.get_entry(rel_path)
         if entry is None:
             return None
         return entry.plugin.get_ast_sexp(
@@ -314,7 +382,7 @@ class Indexer:
 
         Returns None if file not found.
         """
-        entry = self._index.get(rel_path)
+        entry = self.get_entry(rel_path)
         if entry is None:
             return None
         return entry.plugin.extract_variables(entry.source, fn_name)
@@ -441,7 +509,7 @@ class Indexer:
         # Build results
         results = []
         for i, (f, name, typ, line) in enumerate(nodes):
-            if file_path and f != file_path:
+            if file_path and f != _norm_rel(file_path):
                 continue
             results.append({
                 "file": f,
@@ -477,6 +545,7 @@ class Indexer:
         Returns:
             list of {"file", "name", "line", "confidence", "reason"}, sorted by confidence desc.
         """
+        file_path = _norm_rel(file_path)
         if file_path not in self._index:
             return []
 
@@ -586,7 +655,7 @@ class Indexer:
             if len(functions) < 2:
                 continue
             if file_path:
-                if not any(f["file"] == file_path for f in functions):
+                if not any(f["file"] == _norm_rel(file_path) for f in functions):
                     continue
             clone_groups.append({
                 "hash": h,

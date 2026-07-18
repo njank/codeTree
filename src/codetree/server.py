@@ -1,10 +1,11 @@
 from fastmcp import FastMCP
 from pathlib import Path
-from .indexer import Indexer
+from .indexer import Indexer, _norm_rel
 from .cache import Cache
 
 
-def create_server(root: str) -> FastMCP:
+def create_server(root: str, include: list[str] | None = None,
+                  exclude: list[str] | None = None) -> FastMCP:
     mcp = FastMCP("codetree")
     root_path = Path(root)
 
@@ -30,13 +31,15 @@ def create_server(root: str) -> FastMCP:
     cached_mtimes = {
         k: v["mtime"] for k, v in (cache._data or {}).items()
     }
-    indexer = Indexer(root)
+    indexer = Indexer(root, include=include, exclude=exclude)
     indexer.build(cached_mtimes=cached_mtimes)
 
     # Inject cached entries for unchanged files (skip ignored dirs)
     indexed = {str(f.relative_to(root_path)) for f in indexer.files}
     for rel_path, entry_data in (cache._data or {}).items():
         if indexer._should_skip(Path(rel_path)):
+            continue
+        if not indexer._included(rel_path) or indexer._excluded(rel_path):
             continue
         if rel_path not in indexed:
             py_file = root_path / rel_path
@@ -142,7 +145,7 @@ def create_server(root: str) -> FastMCP:
         if not skeleton:
             return f"File not found or empty: {file_path}"
 
-        entry = indexer._index.get(file_path)
+        entry = indexer.get_entry(file_path)
         has_errors = entry.has_errors if entry else False
         return _format_skeleton(skeleton, fmt=format, has_errors=has_errors)
 
@@ -220,7 +223,7 @@ def create_server(root: str) -> FastMCP:
         """
         if err := _validate_path(file_path):
             return err
-        entry = indexer._index.get(file_path)
+        entry = indexer.get_entry(file_path)
         if entry is None:
             return f"File not found: {file_path}"
         imports = entry.plugin.extract_imports(entry.source)
@@ -253,7 +256,7 @@ def create_server(root: str) -> FastMCP:
                 parts.append(f"File not found or empty: {fp}")
                 parts.append("")
                 continue
-            entry = indexer._index.get(fp)
+            entry = indexer.get_entry(fp)
             has_errors = entry.has_errors if entry else False
             parts.append(_format_skeleton(skeleton, fmt=format, has_errors=has_errors))
             parts.append("")
@@ -295,7 +298,7 @@ def create_server(root: str) -> FastMCP:
         """
         if err := _validate_path(file_path):
             return err
-        entry = indexer._index.get(file_path)
+        entry = indexer.get_entry(file_path)
         if entry is None:
             return f"File not found: {file_path}"
         result = entry.plugin.compute_complexity(entry.source, function_name)
@@ -318,7 +321,7 @@ def create_server(root: str) -> FastMCP:
         if file_path is not None:
             if err := _validate_path(file_path):
                 return err
-        if file_path and file_path not in indexer._index:
+        if file_path and indexer.get_entry(file_path) is None:
             return f"File not found: {file_path}"
         dead = indexer.find_dead_code(file_path=file_path)
         if not dead:
@@ -350,7 +353,7 @@ def create_server(root: str) -> FastMCP:
         """
         if err := _validate_path(file_path):
             return err
-        if file_path not in indexer._index:
+        if indexer.get_entry(file_path) is None:
             return f"File not found: {file_path}"
         result = indexer.get_blast_radius(file_path, symbol_name)
         lines = [f"Blast radius for {symbol_name}() in {file_path}:"]
@@ -478,7 +481,7 @@ def create_server(root: str) -> FastMCP:
         """
         if err := _validate_path(file_path):
             return err
-        if file_path not in indexer._index:
+        if indexer.get_entry(file_path) is None:
             return f"File not found: {file_path}"
         tests = indexer.find_tests(file_path, symbol_name)
         if not tests:
@@ -528,7 +531,9 @@ def create_server(root: str) -> FastMCP:
             path_hint: prefer results from files matching this path
             limit: max results (default 10)
         """
-        results = graph_queries.resolve_symbol(query, kind=kind, path_hint=path_hint, limit=limit)
+        results = graph_queries.resolve_symbol(
+            query, kind=kind,
+            path_hint=_norm_rel(path_hint) if path_hint else None, limit=limit)
         return {
             "query": query,
             "matches": [
@@ -563,7 +568,8 @@ def create_server(root: str) -> FastMCP:
             offset: pagination offset (default 0)
         """
         return graph_queries.search_graph(
-            query=query, kind=kind, file_pattern=file_pattern,
+            query=query, kind=kind,
+            file_pattern=_norm_rel(file_pattern) if file_pattern else None,
             relationship=relationship, direction=direction,
             min_degree=min_degree, max_degree=max_degree,
             limit=limit, offset=offset,
@@ -608,11 +614,11 @@ def create_server(root: str) -> FastMCP:
             return {"error": err}
 
         if mode == "cross_taint":
-            if file_path not in indexer._index:
+            if indexer.get_entry(file_path) is None:
                 return {"error": f"File not found: {file_path}"}
-            return extract_cross_function_taint(indexer, file_path, function_name, depth=depth)
+            return extract_cross_function_taint(indexer, _norm_rel(file_path), function_name, depth=depth)
 
-        entry = indexer._index.get(file_path)
+        entry = indexer.get_entry(file_path)
         if entry is None:
             return {"error": f"File not found: {file_path}"}
 
@@ -662,6 +668,7 @@ def create_server(root: str) -> FastMCP:
         if file_path is not None:
             if err := _validate_path(file_path):
                 return err
+            file_path = _norm_rel(file_path)
         result = graph_queries.get_dependency_graph(file_path=file_path, format=format)
         summary = f"\n\n{result['nodes']} files, {result['edges']} import edges"
         return result["content"] + summary
@@ -687,6 +694,7 @@ def create_server(root: str) -> FastMCP:
         if file_path is not None:
             if err := _validate_path(file_path):
                 return err
+            file_path = _norm_rel(file_path)
 
         if mode == "blame":
             if not file_path:
@@ -742,6 +750,7 @@ def create_server(root: str) -> FastMCP:
         if file_path is not None:
             if err := _validate_path(file_path):
                 return err
+            file_path = _norm_rel(file_path)
         results = graph_queries.suggest_docs(indexer, file_path=file_path, symbol_name=symbol_name)
         if not results:
             return "No undocumented functions found."
@@ -762,6 +771,7 @@ def create_server(root: str) -> FastMCP:
     return mcp
 
 
-def run(root: str):
-    mcp = create_server(root)
+def run(root: str, include: list[str] | None = None,
+        exclude: list[str] | None = None):
+    mcp = create_server(root, include=include, exclude=exclude)
     mcp.run()
