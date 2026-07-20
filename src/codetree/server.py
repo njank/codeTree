@@ -1,13 +1,29 @@
+import functools
+import sys
+import threading
+import time
 from fastmcp import FastMCP
 from pathlib import Path
 from .indexer import Indexer, _norm_rel
 from .cache import Cache
 
 
+def _log(msg: str) -> None:
+    """Startup progress to stderr. NEVER stdout: that carries the MCP
+    protocol. Claude Desktop pipes stderr to logs/mcp-server-<name>.log,
+    so this is how users can watch indexing progress."""
+    print(f"[codetree] {msg}", file=sys.stderr, flush=True)
+
+
 def create_server(root: str, include: list[str] | None = None,
-                  exclude: list[str] | None = None) -> FastMCP:
+                  exclude: list[str] | None = None,
+                  background: bool = False) -> FastMCP:
     mcp = FastMCP("codetree")
     root_path = Path(root)
+    _t_start = time.perf_counter()
+    _log(f"starting: root={root}"
+         + (f" include={include}" if include else "")
+         + (f" exclude={exclude}" if exclude else ""))
 
     def _validate_path(file_path: str | None, _root: Path = root_path) -> str | None:
         """Return an error string if file_path escapes the repo root, else None."""
@@ -23,60 +39,117 @@ def create_server(root: str, include: list[str] | None = None,
         except ValueError:
             return f"Error: path '{file_path}' is outside the repo root — access denied"
 
-    # Load cache
-    cache = Cache(root)
-    cache.load()
+    # ── Startup state ─────────────────────────────────────────────────────
+    # In background mode the MCP handshake is answered immediately while
+    # indexing runs in a worker thread; every tool call blocks on `ready`
+    # via _ensure_ready() before touching indexer/graph state.
+    indexer: Indexer | None = None
+    graph_store = None
+    graph_queries = None
+    startup_error: str | None = None
+    ready = threading.Event()
 
-    # Build index, skipping unchanged files
-    cached_mtimes = {
-        k: v["mtime"] for k, v in (cache._data or {}).items()
-    }
-    indexer = Indexer(root, include=include, exclude=exclude)
-    indexer.build(cached_mtimes=cached_mtimes)
+    def _startup():
+        nonlocal indexer, graph_store, graph_queries, startup_error
+        try:
+            # Load cache
+            cache = Cache(root)
+            cache.load()
 
-    # Inject cached entries for unchanged files (skip ignored dirs)
-    indexed = {str(f.relative_to(root_path)) for f in indexer.files}
-    for rel_path, entry_data in (cache._data or {}).items():
-        if indexer._should_skip(Path(rel_path)):
-            continue
-        if not indexer._included(rel_path) or indexer._excluded(rel_path):
-            continue
-        if rel_path not in indexed:
-            py_file = root_path / rel_path
-            if py_file.exists():
-                mtime = py_file.stat().st_mtime
-                if cache.is_valid(rel_path, mtime):
-                    indexer.inject_cached(
-                        rel_path=rel_path,
-                        py_file=py_file,
-                        source=py_file.read_bytes(),
-                        skeleton=entry_data.get("skeleton", []),
-                        mtime=mtime,
-                    )
+            # Build index, skipping unchanged files
+            cached_mtimes = {
+                k: v["mtime"] for k, v in (cache._data or {}).items()
+            }
+            indexer = Indexer(root, include=include, exclude=exclude)
+            indexer.build(cached_mtimes=cached_mtimes)
+            _log(f"indexed {len(indexer._index)} changed files "
+                 f"in {time.perf_counter() - _t_start:.1f}s, building graph...")
 
-    # Rebuild definition index once after all injections (DATA-01, DATA-02, DATA-03 fix)
-    indexer._rebuild_definitions()
+            # Inject cached entries for unchanged files (skip ignored dirs)
+            indexed = {str(f.relative_to(root_path)) for f in indexer.files}
+            for rel_path, entry_data in (cache._data or {}).items():
+                if indexer._should_skip(Path(rel_path)):
+                    continue
+                if not indexer._included(rel_path) or indexer._excluded(rel_path):
+                    continue
+                if rel_path not in indexed:
+                    py_file = root_path / rel_path
+                    if py_file.exists():
+                        mtime = py_file.stat().st_mtime
+                        if cache.is_valid(rel_path, mtime):
+                            indexer.inject_cached(
+                                rel_path=rel_path,
+                                py_file=py_file,
+                                source=py_file.read_bytes(),
+                                skeleton=entry_data.get("skeleton", []),
+                                mtime=mtime,
+                            )
 
-    # Save updated cache
-    for rel_path, file_entry in indexer._index.items():
-        cache.set(rel_path, {
-            "mtime": file_entry.mtime,
-            "skeleton": file_entry.skeleton,
-        })
-    cache.save()
+            # Rebuild definition index once after all injections (DATA-01, DATA-02, DATA-03 fix)
+            indexer._rebuild_definitions()
 
-    # ── Build persistent graph ───────────────────────────────────────────
-    import atexit
-    from .graph.store import GraphStore
-    from .graph.builder import GraphBuilder
-    from .graph.queries import GraphQueries
+            # Save updated cache
+            for rel_path, file_entry in indexer._index.items():
+                cache.set(rel_path, {
+                    "mtime": file_entry.mtime,
+                    "skeleton": file_entry.skeleton,
+                })
+            cache.save()
 
-    graph_store = GraphStore(root)
-    graph_store.open()
-    atexit.register(graph_store.close)
-    graph_builder = GraphBuilder(root, graph_store)
-    graph_builder.build(indexer=indexer)
-    graph_queries = GraphQueries(graph_store)
+            # Build persistent graph
+            import atexit
+            from .graph.store import GraphStore
+            from .graph.builder import GraphBuilder
+            from .graph.queries import GraphQueries
+
+            graph_store = GraphStore(root)
+            graph_store.open()
+            atexit.register(graph_store.close)
+            graph_builder = GraphBuilder(root, graph_store)
+            _stats = graph_builder.build(indexer=indexer)
+            graph_queries = GraphQueries(graph_store)
+            _log(f"ready in {time.perf_counter() - _t_start:.1f}s: "
+                 f"{len(indexer._index)} files, "
+                 f"{_stats.get('files_indexed', 0)} reindexed / "
+                 f"{_stats.get('files_skipped', 0)} unchanged, "
+                 f"{_stats.get('symbols_created', 0)} symbols, "
+                 f"{_stats.get('edges_created', 0)} edges")
+        except Exception as e:
+            startup_error = f"{type(e).__name__}: {e}"
+            _log(f"startup FAILED: {startup_error}")
+            if not background:
+                raise  # synchronous callers get the original exception
+        finally:
+            ready.set()
+
+    if background:
+        threading.Thread(target=_startup, name="codetree-startup", daemon=True).start()
+        _log("MCP handshake available; indexing continues in background")
+    else:
+        _startup()
+
+    def _ensure_ready() -> str | None:
+        """Block until background indexing finished; return error text if it failed."""
+        if not ready.is_set():
+            _log("tool call waiting for indexing to finish...")
+            ready.wait()
+        if startup_error:
+            return f"codetree startup failed: {startup_error}"
+        return None
+
+    def _tool(*d_args, **d_kwargs):
+        """Drop-in for mcp.tool() that gates calls on startup completion."""
+        decorator = mcp.tool(*d_args, **d_kwargs)
+
+        def decorate(fn):
+            @functools.wraps(fn)
+            def gated(*args, **kwargs):
+                err = _ensure_ready()
+                if err is not None:
+                    return {"error": err} if fn.__annotations__.get("return") is dict else err
+                return fn(*args, **kwargs)
+            return decorator(gated)
+        return decorate
 
     # ── Skeleton formatting helpers ──────────────────────────────────────────
     _TYPE_ABBREV = {
@@ -131,7 +204,7 @@ def create_server(root: str, include: list[str] | None = None,
                 lines.append(f"{abbrev} {name}{params}:{line}{doc_suffix}")
         return "\n".join(lines)
 
-    @mcp.tool()
+    @_tool()
     def get_file_skeleton(file_path: str, format: str = "full") -> str:
         """Get all classes and function signatures in a source file without their bodies.
 
@@ -149,7 +222,7 @@ def create_server(root: str, include: list[str] | None = None,
         has_errors = entry.has_errors if entry else False
         return _format_skeleton(skeleton, fmt=format, has_errors=has_errors)
 
-    @mcp.tool()
+    @_tool()
     def get_symbol(file_path: str, symbol_name: str) -> str:
         """Get the full source code of a specific function or class by name.
 
@@ -165,7 +238,7 @@ def create_server(root: str, include: list[str] | None = None,
         source, line = result
         return f"# {file_path}:{line}\n{source}"
 
-    @mcp.tool()
+    @_tool()
     def find_references(symbol_name: str) -> str:
         """Find all usages of a symbol across the entire repo.
 
@@ -181,7 +254,7 @@ def create_server(root: str, include: list[str] | None = None,
             lines.append(f"  {ref['file']}:{ref['line']}")
         return "\n".join(lines)
 
-    @mcp.tool()
+    @_tool()
     def get_call_graph(file_path: str, function_name: str) -> str:
         """Get what a function calls and what calls it across the repo.
 
@@ -214,7 +287,7 @@ def create_server(root: str, include: list[str] | None = None,
 
         return "\n".join(lines)
 
-    @mcp.tool()
+    @_tool()
     def get_imports(file_path: str) -> str:
         """Get import/use statements from a source file.
 
@@ -234,7 +307,7 @@ def create_server(root: str, include: list[str] | None = None,
             lines.append(f"  {imp['line']}: {imp['text']}")
         return "\n".join(lines)
 
-    @mcp.tool()
+    @_tool()
     def get_skeletons(file_paths: list[str], format: str = "full") -> str:
         """Get skeletons for multiple files in one call.
 
@@ -262,7 +335,7 @@ def create_server(root: str, include: list[str] | None = None,
             parts.append("")
         return "\n".join(parts).rstrip()
 
-    @mcp.tool()
+    @_tool()
     def get_symbols(symbols: list[dict]) -> str:
         """Get the full source code of multiple symbols in one call.
 
@@ -288,7 +361,7 @@ def create_server(root: str, include: list[str] | None = None,
                 parts.append(f"# {fp}:{line}\n{source}")
         return "\n\n".join(parts)
 
-    @mcp.tool()
+    @_tool()
     def get_complexity(file_path: str, function_name: str) -> str:
         """Get cyclomatic complexity of a function.
 
@@ -311,7 +384,7 @@ def create_server(root: str, include: list[str] | None = None,
             line += f"\n  {', '.join(parts)}"
         return line
 
-    @mcp.tool()
+    @_tool()
     def find_dead_code(file_path: str | None = None) -> str:
         """Find symbols that are defined but never referenced elsewhere in the repo.
 
@@ -341,7 +414,7 @@ def create_server(root: str, include: list[str] | None = None,
         lines.append(f"\nSummary: {total} dead symbol{'s' if total != 1 else ''} across {file_count} file{'s' if file_count != 1 else ''}")
         return "\n".join(lines)
 
-    @mcp.tool()
+    @_tool()
     def get_blast_radius(file_path: str, symbol_name: str) -> str:
         """Find all functions transitively affected if a symbol is changed.
 
@@ -384,7 +457,7 @@ def create_server(root: str, include: list[str] | None = None,
         lines.append(f"\nImpact summary: {total_affected} function{'s' if total_affected != 1 else ''} in {affected_files} file{'s' if affected_files != 1 else ''} may be affected")
         return "\n".join(lines)
 
-    @mcp.tool()
+    @_tool()
     def detect_clones(file_path: str | None = None, min_lines: int = 5) -> str:
         """Find duplicate or near-duplicate functions in the repo.
 
@@ -413,7 +486,7 @@ def create_server(root: str, include: list[str] | None = None,
         lines.append(f"\nSummary: {total_groups} clone group{'s' if total_groups != 1 else ''}, {total_fns} functions")
         return "\n".join(lines)
 
-    @mcp.tool()
+    @_tool()
     def search_symbols(query: str | None = None, type: str | None = None,
                        parent: str | None = None, has_doc: bool | None = None,
                        min_complexity: int | None = None,
@@ -468,7 +541,7 @@ def create_server(root: str, include: list[str] | None = None,
         lines.append(f"\nFound {len(results)} symbol{'s' if len(results) != 1 else ''}")
         return "\n".join(lines)
 
-    @mcp.tool()
+    @_tool()
     def find_tests(file_path: str, symbol_name: str) -> str:
         """Find test functions associated with a symbol.
 
@@ -494,18 +567,41 @@ def create_server(root: str, include: list[str] | None = None,
 
     # ── Graph-backed onboarding tools ────────────────────────────────────────
 
+    # Deliberately NOT gated via _tool(): this is the readiness probe.
+    # While startup indexing runs in the background, every other tool
+    # blocks; agents can poll index_status to know when the server is
+    # ready without blocking.
     @mcp.tool()
     def index_status() -> dict:
-        """Report on graph index freshness and stats."""
+        """Report indexing status and graph stats.
+
+        Never blocks: while startup indexing is still running it returns
+        {"status": "indexing"} immediately (all other tools wait for the
+        index). Once it returns {"status": "ready"}, all tools answer
+        without delay.
+        """
+        if not ready.is_set():
+            return {
+                "graph_exists": False,
+                "status": "indexing",
+                "detail": "startup indexing in progress; other tools block until ready",
+            }
+        if startup_error:
+            return {
+                "graph_exists": False,
+                "status": "failed",
+                "error": f"codetree startup failed: {startup_error}",
+            }
         stats = graph_store.stats()
         last = graph_store.get_meta("last_indexed_at")
         return {
             "graph_exists": True,
+            "status": "ready",
             **stats,
             "last_indexed_at": last,
         }
 
-    @mcp.tool()
+    @_tool()
     def get_repository_map(max_items: int = 5) -> dict:
         """Get a compact overview of the repository for onboarding.
 
@@ -517,7 +613,7 @@ def create_server(root: str, include: list[str] | None = None,
         """
         return graph_queries.repository_map(max_items=max_items)
 
-    @mcp.tool()
+    @_tool()
     def resolve_symbol(query: str, kind: str | None = None,
                        path_hint: str | None = None, limit: int = 10) -> dict:
         """Disambiguate a short symbol name into ranked qualified matches.
@@ -549,7 +645,7 @@ def create_server(root: str, include: list[str] | None = None,
             ],
         }
 
-    @mcp.tool()
+    @_tool()
     def search_graph(query: str | None = None, kind: str | None = None,
                      file_pattern: str | None = None, relationship: str | None = None,
                      direction: str | None = None, min_degree: int | None = None,
@@ -575,7 +671,7 @@ def create_server(root: str, include: list[str] | None = None,
             limit=limit, offset=offset,
         )
 
-    @mcp.tool()
+    @_tool()
     def get_change_impact(symbol_query: str | None = None,
                           diff_scope: str | None = None, depth: int = 3) -> dict:
         """Analyze impact of a change — by explicit symbol or git diff.
@@ -596,7 +692,7 @@ def create_server(root: str, include: list[str] | None = None,
 
     # ── Dataflow & taint analysis ────────────────────────────────────────────
 
-    @mcp.tool()
+    @_tool()
     def analyze_dataflow(file_path: str, function_name: str,
                          mode: str = "flow", depth: int = 3) -> dict:
         """Analyze variable dataflow and security taint paths in a function.
@@ -631,7 +727,7 @@ def create_server(root: str, include: list[str] | None = None,
             return {"error": f"Function '{function_name}' not found in {file_path}"}
         return result
 
-    @mcp.tool()
+    @_tool()
     def find_hot_paths(top_n: int = 10) -> str:
         """Find high-leverage optimization targets by combining complexity and call frequency.
 
@@ -653,7 +749,7 @@ def create_server(root: str, include: list[str] | None = None,
         lines.append(f"\nTop {len(results)} optimization targets")
         return "\n".join(lines)
 
-    @mcp.tool()
+    @_tool()
     def get_dependency_graph(file_path: str | None = None,
                               format: str = "mermaid") -> str:
         """Get the file dependency graph as Mermaid syntax or a list.
@@ -673,7 +769,7 @@ def create_server(root: str, include: list[str] | None = None,
         summary = f"\n\n{result['nodes']} files, {result['edges']} import edges"
         return result["content"] + summary
 
-    @mcp.tool()
+    @_tool()
     def git_history(mode: str = "blame", file_path: str | None = None,
                     top_n: int = 20, since: str | None = None,
                     min_commits: int = 3) -> str:
@@ -738,7 +834,7 @@ def create_server(root: str, include: list[str] | None = None,
         else:
             return f"Unknown mode '{mode}'. Use 'blame', 'churn', or 'coupling'."
 
-    @mcp.tool()
+    @_tool()
     def suggest_docs(file_path: str | None = None,
                      symbol_name: str | None = None) -> str:
         """Find undocumented functions and assemble context for writing docs.
@@ -773,5 +869,8 @@ def create_server(root: str, include: list[str] | None = None,
 
 def run(root: str, include: list[str] | None = None,
         exclude: list[str] | None = None):
-    mcp = create_server(root, include=include, exclude=exclude)
+    # background=True: answer the MCP initialize handshake immediately so
+    # clients (Claude Desktop allows ~60s) never time out on large repos;
+    # tool calls block until indexing finishes.
+    mcp = create_server(root, include=include, exclude=exclude, background=True)
     mcp.run()

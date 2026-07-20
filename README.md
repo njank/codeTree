@@ -115,7 +115,7 @@ The agent sees every class, method, and docstring — with line numbers — with
 
 | Tool | Purpose |
 |------|---------|
-| `index_status()` | Graph index freshness and stats |
+| `index_status()` | Indexing status (never blocks; poll while background indexing runs) and graph stats |
 | `get_repository_map(max_items?)` | Compact repo overview: languages, entry points, hotspots |
 | `resolve_symbol(query, kind?, path_hint?)` | Disambiguate short name into ranked qualified matches |
 | `search_graph(query?, kind?, file_pattern?)` | Graph search with degree filters and pagination |

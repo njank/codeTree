@@ -299,7 +299,7 @@ Found 3 tests
 
 ### 14. `index_status()`
 
-Is the graph up to date?
+Is the graph up to date? Never blocks: during background startup indexing it returns `{"status": "indexing"}` immediately (all other tools wait until the index is ready), so agents can poll it as a readiness probe.
 
 ```
 Agent: index_status()
@@ -307,6 +307,7 @@ Agent: index_status()
 Returns:
 {
   "graph_exists": true,
+  "status": "ready",
   "files": 42,
   "symbols": 315,
   "edges": 580,

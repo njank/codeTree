@@ -30,7 +30,7 @@ It exposes **23 tools** over MCP:
 
 | Tool | Purpose | Returns |
 |------|---------|---------|
-| `index_status()` | Graph index freshness and stats | `{graph_exists, files, symbols, edges, last_indexed_at}` |
+| `index_status()` | Indexing status and graph stats; never blocks during background startup indexing | `{graph_exists, status (indexing/ready/failed), files, symbols, edges, last_indexed_at}` |
 | `get_repository_map(max_items?)` | Compact repo overview for agent onboarding | `{languages, entry_points, hotspots, start_here, test_roots, stats}` |
 | `resolve_symbol(query, kind?, path_hint?)` | Disambiguate short symbol names into qualified matches | `{matches: [{qualified_name, name, kind, file, line}]}` |
 | `search_graph(query?, kind?, file_pattern?, ...)` | Structured graph search with pagination and degree filtering | `{total, results: [{qualified_name, kind, in_degree, out_degree}]}` |

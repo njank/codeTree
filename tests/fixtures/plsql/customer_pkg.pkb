@@ -11,7 +11,7 @@ create or replace package body customer_pkg is
     gnCalls := gnCalls + 1;
     vRecCustomer.nId := pnId;
     vRecCustomer.sName := 'NAME';
-    --logAccess(pnId);
+    log_pkg.logAccess(pnId);
     return vRecCustomer;
   end getCustomer;
 

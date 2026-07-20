@@ -159,7 +159,7 @@ The agent sees every class, method, and docstring — with line numbers — with
 
 | Tool | What it does | Example |
 |------|-------------|---------|
-| `index_status` | Graph index freshness and stats | See how many files, symbols, and edges are indexed |
+| `index_status` | Indexing status and graph stats | Poll readiness during background indexing; see files, symbols, edges |
 | `get_repository_map` | Compact repo overview for agent onboarding | Languages, entry points, hotspots, suggested starting points |
 | `resolve_symbol` | Disambiguate a short name into ranked qualified matches | "add" → `calc.py::Calculator.add`, `math.py::add` |
 | `search_graph` | Flexible graph search with degree filters and pagination | All functions with >5 inbound calls |

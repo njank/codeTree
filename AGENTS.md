@@ -23,7 +23,7 @@ It exposes **23 tools** over MCP:
 | `detect_clones(file_path?, min_lines?)` | Duplicate/near-duplicate functions | `Clone group 1 (2 functions, 12 lines each):` |
 | `search_symbols(query?, type?, parent?, ..., format?)` | Flexible symbol search; `format="compact"` omits doc lines | `calc.py: class Calculator → line 1` |
 | `find_tests(file_path, symbol_name)` | Find test functions for a symbol | `test_calc.py: test_add() → line 3  (name match)` |
-| `index_status()` | Graph index freshness and stats | `{files: 42, symbols: 315, edges: 580}` |
+| `index_status()` | Indexing status and graph stats; never blocks during background startup indexing | `{status: "ready", files: 42, symbols: 315, edges: 580}` |
 | `get_repository_map(max_items?)` | Compact repo overview for onboarding | `{languages: {py: 20}, hotspots: [...], start_here: [...]}` |
 | `resolve_symbol(query, kind?, path_hint?)` | Disambiguate short name into qualified matches | `calc.py::Calculator.add → line 11` |
 | `search_graph(query?, kind?, file_pattern?)` | Graph search with degree filters and pagination | `{total: 5, results: [...]}` |

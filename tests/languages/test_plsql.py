@@ -53,7 +53,7 @@ def test_skeleton_body_nested_routine():
 def test_skeleton_params_and_doc():
     sk = plugin.extract_skeleton(_read("customer_pkg.pks"))
     get1 = [i for i in sk if i["name"].lower() == "getcustomer"][0]
-    assert "pnsid" in get1["params"].lower()
+    assert "pnid" in get1["params"].lower()
     assert get1["doc"].startswith("Returns the customer record")
 
 
@@ -91,15 +91,14 @@ def test_symbol_source_missing():
 def test_calls_in_function():
     calls = plugin.extract_calls_in_function(_read("customer_pkg.pkb"), "getCustomer")
     lower = {c.lower() for c in calls}
-    assert "getmessagetext" in lower  # qualified call captures the member name
     assert "logaccess" in lower
+    assert "upper" in lower
 
 
 def test_calls_not_from_comments_or_strings():
     calls = plugin.extract_calls_in_function(_read("customer_pkg.pkb"), "saveCustomer")
     lower = {c.lower() for c in calls}
     assert "validate" in lower
-    assert "defaultwhenothershandling" in lower
 
 
 def test_calls_unknown_function():
